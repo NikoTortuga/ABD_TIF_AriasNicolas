@@ -1,0 +1,1218 @@
+-- Trabajo Integrador Final Administración de Base de Datos:
+
+-- ********************************************Ejercicio 1******************************************************
+
+DECLARE @PromedioOriginal MONEY;
+DECLARE @PrecioMinimoModificado MONEY;
+DECLARE @FilasModificadas INT;
+
+BEGIN TRY
+
+-- 1. Iniciar transación 
+BEGIN TRANSACTION;
+PRINT '>>> Iniciando proceso de actualización nativa';
+
+-- Obtener promedio original
+SELECT @PromedioOriginal = AVG(ListPrice)
+FROM Production.Product
+WHERE ListPrice > 0;
+
+PRINT 'Auditoria: Promedio original de precios:$' + CAST(@PromedioOriginal as VARCHAR);
+
+-- 2. Logica de negocios:
+
+    BEGIN TRANSACTION;
+    PRINT '>>> Transacción iniciada';
+
+    -- Actualización masiva
+    UPDATE Production.Product
+    SET ListPrice = ListPrice * 1.15
+    WHERE ListPrice > 0;
+
+    SET @FilasModificadas = @@ROWCOUNT;
+    PRINT '>>> Auditoria: Productos afectados por el incremento: ' + CAST(@FilasModificadas AS VARCHAR(10));
+
+-- 3. Control de transacciones.
+    SELECT @MinimoPostIncremento = MIN(ListPrice)
+    FROM Production.Product
+    WHERE ListPrice > 0;
+
+    PRINT '>>> Auditoria: El precio mínimo post-incremento es: $' + CAST(@MinimoPostIncremento AS VARCHAR(20));
+
+    IF @MinimoPostIncremento <= @PromedioOriginal
+    BEGIN
+        PRINT '>>> Alerta: El mínimo no supera el promedio. Se debe revertir.';
+        ROLLBACK TRANSACTION;
+        PRINT '>>> Auditoria: Transacción revertida (ROLLBACK).';
+    END
+    ELSE
+    BEGIN
+        COMMIT TRANSACTION;
+        PRINT '>>> Auditoria: Transacción confirmada (COMMIT).';
+    END
+
+END TRY
+BEGIN CATCH
+
+-- 4. Manejo de errores dinamicos:
+
+    PRINT '>>> Error detectado: ' + ERROR_MESSAGE();
+    
+    IF @@TRANCOUNT > 0
+    BEGIN
+        ROLLBACK TRANSACTION;
+        PRINT '>>> Auditoria: Se detectó transacción abierta y fue revertida.';
+    END
+
+    -- Relanzar el error
+    DECLARE @Msg NVARCHAR(2048) = 'Error en el proceso: ' + ERROR_MESSAGE();
+    THROW 50000, @Msg, 1;
+END CATCH;
+
+
+-- ********************************************Ejercicio 2******************************************************
+USE master;
+GO
+-- REQUERIMIENTO 1: INFRAESTRUCTURA DE ALMACENAMIENTO
+PRINT '>>> 1. Creando Base de Datos SportNetDB con distribución física...';
+
+CREATE DATABASE SportNetDB
+ON PRIMARY 
+(
+    NAME = SportNetDB_Primary,
+    FILENAME = 'C:\SQLData\SportNetDB_Prod.mdf',
+    SIZE = 10MB,
+    MAXSIZE = UNLIMITED,
+    FILEGROWTH = 2MB
+),
+FILEGROUP HISTORICO -- Grupo de archivos secundario para auditoría masiva
+(
+    NAME = SportNetDB_Historico,
+    FILENAME = 'C:\SQLData\SportNetDB_Hist.ndf',
+    SIZE = 15MB,
+    MAXSIZE = UNLIMITED,
+    FILEGROWTH = 5MB -- Balanceo optimizado para datos masivos antiguos
+)
+LOG ON
+(
+    NAME = SportNetDB_Log,
+    FILENAME = 'C:\SQLData\SportNetDB_Log.ldf',
+    SIZE = 5MB,
+    MAXSIZE = 2GB,
+    FILEGROWTH = 1MB
+);
+GO
+
+-- Cambiar al contexto de la base de datos recién creada
+USE SportNetDB;
+GO
+
+
+-- REQUERIMIENTO 2: ORGANIZACIÓN DE OBJETOS 
+PRINT '>>> 2. Creando capas lógicas mediante Esquemas...';
+GO
+
+CREATE SCHEMA Socios;
+GO
+
+CREATE SCHEMA Facturacion;
+GO
+
+-- REQUERIMIENTO 3: ESTANDARIZACIÓN DE DOMINIOS 
+PRINT '>>> 3. Creando tipos de datos de usuario (UDT)...';
+GO
+
+-- TipoDocumento: basado en VARCHAR(12), de carácter obligatorio (NOT NULL)
+CREATE TYPE Socios.TipoDocumento FROM VARCHAR(12) NOT NULL;
+GO
+
+-- CodigoPostal: basado en CHAR(8), opcional (NULL)
+CREATE TYPE Socios.CodigoPostal FROM CHAR(8) NULL;
+GO
+
+-- REQUERIMIENTO 4: CONSTRUCCIÓN DE TABLAS RELACIONALES
+PRINT '>>> 4. Creando tablas relacionales con asignación explícita de Filegroups...';
+GO
+
+-- Tabla A: Socios.FichaPersonal (Ubicada físicamente en PRIMARY)
+CREATE TABLE Socios.FichaPersonal (
+    SocioID INT IDENTITY(1,1),
+    Documento Socios.TipoDocumento,     -- Uso del UDT Obligatorio
+    Nombre VARCHAR(50) NOT NULL,
+    Apellido VARCHAR(50) NOT NULL,
+    FechaNacimiento DATE NOT NULL,
+    CP Socios.CodigoPostal,             -- Uso del UDT Opcional
+    FechaAlta DATETIME DEFAULT GETDATE(),
+    
+    -- Restricciones de Clave Primaria
+    CONSTRAINT PK_FichaPersonal PRIMARY KEY CLUSTERED (SocioID)
+) ON [PRIMARY]; -- Asignación al Filegroup PRIMARY
+GO
+
+
+-- Tabla B: Facturacion.Aranceles (Ubicada en PRIMARY para interactuar con el esquema de Facturación)
+CREATE TABLE Facturacion.Aranceles (
+    ArancelID INT IDENTITY(1,1),
+    Descripcion VARCHAR(100) NOT NULL,
+    CostoMensual DECIMAL(10,2) NOT NULL,
+    
+    CONSTRAINT PK_Aranceles PRIMARY KEY CLUSTERED (ArancelID)
+) ON [PRIMARY];
+GO
+
+
+-- Tabla C: Socios.RegistroAccesos (Ubicada explícitamente en HISTORICO)
+CREATE TABLE Socios.RegistroAccesos (
+    AccesoID BIGINT IDENTITY(1,1),
+    SocioID INT NOT NULL,
+    FechaHoraAcceso DATETIME NOT NULL DEFAULT GETDATE(),
+    NroMolinete INT NOT NULL,
+    Permitido BIT NOT NULL, -- 1: Sí, 0: No
+    
+    -- Restricción de Clave Primaria Compleja
+    CONSTRAINT PK_RegistroAccesos PRIMARY KEY CLUSTERED (AccesoID, FechaHoraAcceso),
+    
+    -- Restricción de Clave Foránea (Integridad Referencial)
+    CONSTRAINT FK_RegistroAccesos_FichaPersonal FOREIGN KEY (SocioID)
+        REFERENCES Socios.FichaPersonal (SocioID)
+) ON [HISTORICO]; -- Asignación explícita al Filegroup HISTORICO
+GO
+
+-- VERIFICACIÓN FINAL DE LA INFRAESTRUCTURA (Auditoría interna)
+PRINT '======================================================================';
+PRINT '>>> PROCESO FINALIZADO. VERIFICACIÓN DE ARCHIVOS Y FILEGROUPS:';
+PRINT '======================================================================';
+
+SELECT 
+    df.name AS NombreLogico,
+    df.physical_name AS RutaFisica,
+    fg.name AS GrupoDeArchivos,
+    (df.size * 8) / 1024 AS TamanoActual_MB
+FROM sys.database_files df
+LEFT JOIN sys.filegroups fg ON df.data_space_id = fg.data_space_id;
+GO
+
+-- ********************************************Ejercicio 3******************************************************
+
+
+
+
+-- ********************************************Ejercicio 4******************************************************
+USE SportNetDB;
+GO
+
+-- ============================================================================
+-- 1. PREPARACIÓN DEL ESCENARIO (ESTRUCTURA BASE SIN ÍNDICES AUTOMÁTICOS)
+-- ============================================================================
+PRINT '======================================================================';
+PRINT '>>> 1. PREPARACIÓN DEL ESCENARIO';
+PRINT '======================================================================';
+
+IF OBJECT_ID('Socios.FichaPersonal') IS NOT NULL 
+    DROP TABLE Socios.FichaPersonal;
+GO
+
+CREATE TABLE Socios.FichaPersonal
+(
+    SocioID CHAR(5) NOT NULL,
+    Documento CHAR(8) NOT NULL,
+    Apellido VARCHAR(30) NOT NULL,
+    Nombre VARCHAR(30) NOT NULL,
+    ArancelMensual DECIMAL(10,2) NULL
+);
+GO
+
+-- Carga inicial con datos duplicados adrede ('Pérez')
+INSERT INTO Socios.FichaPersonal (SocioID, Documento, Apellido, Nombre, ArancelMensual)
+VALUES  
+('S0001', '40123456', 'Pérez', 'Juan', 8500.00),
+('S0002', '41123457', 'Pérez', 'María', 7250.00),
+('S0003', '42123458', 'Gómez', 'Lucas', 9000.00),
+('S0004', '43123459', 'Rodríguez', 'Ana', 6500.00),
+('S0005', '44123460', 'Fernández', 'Luis', 4000.00),
+('S0006', '45123461', 'López', 'Laura', 9750.00);
+GO
+PRINT '    [OK] Tabla base creada e insertados 6 registros (Apellidos duplicados).';
+
+
+-- ============================================================================
+-- 2. CONFLICTO DE UNICIDAD (ANÁLISIS DEL COMPORTAMIENTO DEL MOTOR)
+-- ============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 2. PRUEBA: CONFLICTO DE UNICIDAD';
+PRINT '======================================================================';
+
+-- Envolvemos en un TRY...CATCH para que el error esperado no aborte el script completo
+BEGIN TRY
+    PRINT '    --> Intentando crear un índice agrupado ÚNICO sobre la columna Apellido...';
+    
+    CREATE UNIQUE CLUSTERED INDEX IX_FichaPersonal_Apellido_UniqueCluster
+    ON Socios.FichaPersonal (Apellido);
+    
+END TRY
+BEGIN CATCH
+    PRINT '    [COMPORTAMIENTO DEL MOTOR]: Error esperado capturado de forma correcta.';
+    PRINT '    [CÓDIGO DE ERROR]: ' + CAST(ERROR_NUMBER() AS VARCHAR(10));
+    PRINT '    [MENSAJE]: ' + ERROR_MESSAGE();
+END CATCH;
+GO
+
+
+-- ============================================================================
+-- 3. ESTRATEGIA DE INDEXACIÓN MIXTA
+-- ============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 3. ESTRATEGIA DE INDEXACIÓN MIXTA';
+PRINT '======================================================================';
+
+PRINT '    --> Creando índice agrupado NO ÚNICO para rangos alfabéticos de Apellidos...';
+CREATE CLUSTERED INDEX IX_FichaPersonal_Apellido_Clustered
+ON Socios.FichaPersonal (Apellido);
+
+PRINT '    --> Configurando Clave Primaria de forma NO AGRUPADA (SocioID)...';
+ALTER TABLE Socios.FichaPersonal
+ADD CONSTRAINT PK_FichaPersonal PRIMARY KEY NONCLUSTERED (SocioID);
+GO
+PRINT '    [OK] Índices de la estrategia mixta configurados con éxito.';
+
+
+-- ============================================================================
+-- 4. GARANTÍA DE INTEGRIDAD
+-- ============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 4. GARANTÍA DE INTEGRIDAD';
+PRINT '======================================================================';
+
+PRINT '    --> Creando índice ÚNICO NO AGRUPADO para Documento...';
+CREATE UNIQUE NONCLUSTERED INDEX IX_FichaPersonal_Documento_Unique
+ON Socios.FichaPersonal (Documento);
+GO
+
+-- Simulación de ataque/error a la integridad (Verificación de bloqueo)
+BEGIN TRY
+    PRINT '    --> Verificación de Bloqueo: Intentando insertar un Documento ya existente...';
+    
+    INSERT INTO Socios.FichaPersonal (SocioID, Documento, Apellido, Nombre, ArancelMensual)
+    VALUES ('S0007', '40123456', 'Ortega', 'Diego', 5000.00); -- Documento repetido de S0001
+    
+END TRY
+BEGIN CATCH
+    PRINT '    [INTEGRIDAD RESGUARDADA]: El motor bloqueó el ingreso del duplicado.';
+    PRINT '    [CÓDIGO DE ERROR]: ' + CAST(ERROR_NUMBER() AS VARCHAR(10));
+    PRINT '    [MENSAJE]: ' + ERROR_MESSAGE();
+END CATCH;
+GO
+
+
+-- ============================================================================
+-- 5. REINGENIERÍA ESTRUCTURAL (REFACTORIZACIÓN FINAL)
+-- ============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 5. REINGENIERÍA ESTRUCTURAL (REFACTORIZACIÓN)';
+PRINT '======================================================================';
+
+PRINT '    --> Eliminando restricciones e índices anteriores para reestructurar la tabla...';
+
+-- 5.1 Remover la PK No Agrupada
+ALTER TABLE Socios.FichaPersonal
+DROP CONSTRAINT PK_FichaPersonal;
+
+-- 5.2 Remover el índice agrupado de Apellido
+DROP INDEX IX_FichaPersonal_Apellido_Clustered ON Socios.FichaPersonal;
+GO
+
+PRINT '    --> Regenerando Clave Primaria (SocioID) para que sea el Índice Agrupado Principal...';
+-- Al definir una PRIMARY KEY por defecto sin especificar NONCLUSTERED, SQL Server la crea como CLUSTERED
+ALTER TABLE Socios.FichaPersonal
+ADD CONSTRAINT PK_FichaPersonal_Final PRIMARY KEY CLUSTERED (SocioID);
+GO
+
+PRINT '    [ÉXITO] Tabla refactorizada según directivas de auditoría.';
+PRINT '======================================================================';
+PRINT '>>> PROCESO DE OPTIMIZACIÓN Y CICLO DE VIDA DE ÍNDICES CONCLUIDO';
+PRINT '======================================================================';
+
+-- ********************************************Ejercicio 5******************************************************
+USE AdventureWorks;
+GO
+
+-- =============================================================================
+-- FASE 1: INFRAESTRUCTURA FÍSICA (FILEGROUPS Y ARCHIVOS SECUNDARIOS)
+-- =============================================================================
+PRINT '======================================================================';
+PRINT '>>> FASE 1: Creando Filegroups y Archivos para los Trimestres del 2011';
+PRINT '======================================================================';
+
+-- NOTA: Asegurarse de que la ruta 'C:\SQLData\' exista en el servidor, 
+-- o reemplazarla por la ruta por defecto de su instancia.
+
+-- 1.1 Agregar los 4 Filegroups a la Base de Datos
+ALTER DATABASE AdventureWorks ADD FILEGROUP FG_Ventas2011_Q1;
+ALTER DATABASE AdventureWorks ADD FILEGROUP FG_Ventas2011_Q2;
+ALTER DATABASE AdventureWorks ADD FILEGROUP FG_Ventas2011_Q3;
+ALTER DATABASE AdventureWorks ADD FILEGROUP FG_Ventas2011_Q4;
+GO
+
+-- 1.2 Asociar un archivo físico (.ndf) a cada Filegroup creado
+ALTER DATABASE AdventureWorks ADD FILE (
+    NAME = DF_Ventas2011_Q1, FILENAME = 'C:\SQLData\Ventas2011_Q1.ndf',
+    SIZE = 10MB, FILEGROWTH = 5MB
+) TO FILEGROUP FG_Ventas2011_Q1;
+
+ALTER DATABASE AdventureWorks ADD FILE (
+    NAME = DF_Ventas2011_Q2, FILENAME = 'C:\SQLData\Ventas2011_Q2.ndf',
+    SIZE = 10MB, FILEGROWTH = 5MB
+) TO FILEGROUP FG_Ventas2011_Q2;
+
+ALTER DATABASE AdventureWorks ADD FILE (
+    NAME = DF_Ventas2011_Q3, FILENAME = 'C:\SQLData\Ventas2011_Q3.ndf',
+    SIZE = 10MB, FILEGROWTH = 5MB
+) TO FILEGROUP FG_Ventas2011_Q3;
+
+ALTER DATABASE AdventureWorks ADD FILE (
+    NAME = DF_Ventas2011_Q4, FILENAME = 'C:\SQLData\Ventas2011_Q4.ndf',
+    SIZE = 10MB, FILEGROWTH = 5MB
+) TO FILEGROUP FG_Ventas2011_Q4;
+GO
+PRINT '    [OK] Infraestructura física completada con 4 Filegroups independientes.';
+
+
+-- =============================================================================
+-- FASE 2: LÓGICA DE PARTICIONADO (FUNCIÓN Y ESQUEMA DE PARTICIÓN)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 2: Definiendo la Lógica de Segmentación Temporal';
+PRINT '======================================================================';
+
+-- 2.1 Creación de la Función de Partición por Rangos (RANGE RIGHT)
+-- El criterio RIGHT asigna el valor límite (Boundary) a la partición de la derecha (>=).
+CREATE PARTITION FUNCTION PF_VentasTrimestral2011 (DATETIME)
+AS RANGE RIGHT FOR VALUES 
+(
+    '2011-04-01', -- Valores menores van a P1 (Q1), mayores o iguales a P2 (Q2)
+    '2011-07-01', -- Valores de Julio en adelante van a P3 (Q3)
+    '2011-10-01'  -- Valores de Octubre en adelante van a P4 (Q4)
+);
+GO
+
+-- 2.2 Creación del Esquema de Partición vinculando la función a los Filegroups
+CREATE PARTITION SCHEME PS_VentasTrimestral2011
+AS PARTITION PF_VentasTrimestral2011
+TO (FG_Ventas2011_Q1, FG_Ventas2011_Q2, FG_Ventas2011_Q3, FG_Ventas2011_Q4);
+GO
+PRINT '    [OK] Función de partición y Esquema de asignación mapeados con éxito.';
+
+
+-- =============================================================================
+-- FASE 3: MIGRACIÓN MASIVA E INSERCIÓN EN LÍMITES (TESTEO)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 3: Creación de la Tabla Particionada y Migración de Datos';
+PRINT '======================================================================';
+
+-- 3.1 Construir réplica estructurada de la tabla original
+CREATE TABLE Sales.SalesOrderDetail_Particionada
+(
+    SalesOrderID INT NOT NULL,
+    SalesOrderDetailID INT IDENTITY(1,1) NOT NULL,
+    CarrierTrackingNumber NVARCHAR(25) NULL,
+    OrderQty SMALLINT NOT NULL,
+    ProductID INT NOT NULL,
+    SpecialOfferID INT NOT NULL,
+    UnitPrice MONEY NOT NULL,
+    UnitPriceDiscount MONEY NOT NULL,
+    LineTotal AS (ISNULL((UnitPrice * (1.0 - UnitPriceDiscount)) * OrderQty, 0.0)),
+    ModifiedDate DATETIME NOT NULL DEFAULT GETDATE()
+) 
+ON PS_VentasTrimestral2011(ModifiedDate); -- Aplicación de la arquitectura aquí
+GO
+
+-- 3.2 Migración masiva de la información histórica real del año 2011
+PRINT '    --> Migrando registros históricos del año 2011 de forma nativa...';
+SET IDENTITY_INSERT Sales.SalesOrderDetail_Particionada ON;
+
+INSERT INTO Sales.SalesOrderDetail_Particionada 
+(SalesOrderID, SalesOrderDetailID, CarrierTrackingNumber, OrderQty, ProductID, SpecialOfferID, UnitPrice, UnitPriceDiscount, ModifiedDate)
+SELECT SalesOrderID, SalesOrderDetailID, CarrierTrackingNumber, OrderQty, ProductID, SpecialOfferID, UnitPrice, UnitPriceDiscount, ModifiedDate
+FROM Sales.SalesOrderDetail
+WHERE ModifiedDate >= '2011-01-01' AND ModifiedDate < '2012-01-01';
+
+SET IDENTITY_INSERT Sales.SalesOrderDetail_Particionada OFF;
+GO
+
+-- 3.3 Testeo de inserciones exactas en los límites de los rangos establecidos
+PRINT '    --> Insertando registros de prueba en límites (Lógica RANGE RIGHT)...';
+INSERT INTO Sales.SalesOrderDetail_Particionada (SalesOrderID, OrderQty, ProductID, SpecialOfferID, UnitPrice, UnitPriceDiscount, ModifiedDate)
+VALUES 
+(99999, 1, 777, 1, 100.00, 0, '2011-03-31 23:59:59'), -- Debería ir a P1 (Q1)
+(99999, 5, 777, 1, 100.00, 0, '2011-04-01 00:00:00'); -- Exacto en límite: Debería ir a P2 (Q2)
+GO
+
+
+-- =============================================================================
+-- FASE 4: METADATOS Y AUDITORÍA DE PARTICIONES
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 4: Auditoría de Distribución de Registros en el Motor';
+PRINT '======================================================================';
+
+-- Consulta metadata avanzada para certificar la distribución en almacenamiento
+SELECT 
+    p.partition_number AS NroParticion,
+    fg.name AS NombreFilegroup,
+    p.rows AS CantidadDeRegistros,
+    CAST(rv.value AS DATETIME) AS LimiteDerechoInclusive
+FROM sys.partitions p
+JOIN sys.indexes i ON p.object_id = i.object_id AND p.index_id = i.index_id
+JOIN sys.data_spaces ds ON i.data_space_id = ds.data_space_id
+JOIN sys.partition_schemes ps ON ds.data_space_id = ps.data_space_id
+JOIN sys.partition_functions pf ON ps.function_id = pf.function_id
+LEFT JOIN sys.destination_data_spaces dds ON ps.data_space_id = dds.partition_scheme_id AND p.partition_number = dds.destination_id
+LEFT JOIN sys.filegroups fg ON dds.data_space_id = fg.data_space_id
+LEFT JOIN sys.partition_range_values rv ON pf.function_id = rv.function_id AND p.partition_number = rv.boundary_id
+WHERE p.object_id = OBJECT_ID('Sales.SalesOrderDetail_Particionada') AND i.index_id <= 1
+ORDER BY p.partition_number;
+GO
+
+
+-- =============================================================================
+-- FASE 5: ROLLBACK ESTRUCTURAL (DESMANTELAMIENTO SEGURO)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 5: Secuencia de Limpieza y Rollback Estructural';
+PRINT '======================================================================';
+/* -- Para ejecutar la limpieza del entorno, descomente el bloque inferior:
+
+PRINT '    --> Eliminando la tabla particionada...';
+IF OBJECT_ID('Sales.SalesOrderDetail_Particionada') IS NOT NULL
+    DROP TABLE Sales.SalesOrderDetail_Particionada;
+
+PRINT '    --> Eliminando Esquema y Función de Partición...';
+IF EXISTS (SELECT * FROM sys.partition_schemes WHERE name = 'PS_VentasTrimestral2011')
+    DROP PARTITION SCHEME PS_VentasTrimestral2011;
+
+IF EXISTS (SELECT * FROM sys.partition_functions WHERE name = 'PF_VentasTrimestral2011')
+    DROP PARTITION FUNCTION PF_VentasTrimestral2011;
+
+PRINT '    --> Removiendo Archivos Físicos de la BD...';
+ALTER DATABASE AdventureWorks REMOVE FILE DF_Ventas2011_Q1;
+ALTER DATABASE AdventureWorks REMOVE FILE DF_Ventas2011_Q2;
+ALTER DATABASE AdventureWorks REMOVE FILE DF_Ventas2011_Q3;
+ALTER DATABASE AdventureWorks REMOVE FILE DF_Ventas2011_Q4;
+
+PRINT '    --> Removiendo Filegroups de la BD...';
+ALTER DATABASE AdventureWorks REMOVE FILEGROUP FG_Ventas2011_Q1;
+ALTER DATABASE AdventureWorks REMOVE FILEGROUP FG_Ventas2011_Q2;
+ALTER DATABASE AdventureWorks REMOVE FILEGROUP FG_Ventas2011_Q3;
+ALTER DATABASE AdventureWorks REMOVE FILEGROUP FG_Ventas2011_Q4;
+
+PRINT '    [ÉXITO] Entorno desmantelado de forma segura y limpia.';
+*/
+GO
+
+-- ********************************************Ejercicio 6******************************************************
+USE master;
+GO
+
+-- =============================================================================
+-- REQUERIMIENTO 1: AUDITORÍA DE INSTANCIA (MODO DE SEGURIDAD)
+-- =============================================================================
+PRINT '======================================================================';
+PRINT '>>> 1. AUDITORÍA DEL MODO DE AUTENTICACIÓN';
+PRINT '======================================================================';
+
+DECLARE @AuthenticationMode INT;
+
+-- Consultar la propiedad de conexión a través de SERVERPROPERTY
+EXEC master.dbo.xp_instance_regread 
+    N'HKEY_LOCAL_MACHINE', 
+    N'Software\Microsoft\MSSQLServer\MSSQLServer', 
+    N'LoginMode', 
+    @AuthenticationMode OUTPUT;
+
+IF @AuthenticationMode = 1
+BEGIN
+    PRINT '    [AUDITORÍA]: La instancia está configurada en MODO SOLO WINDOWS.';
+    PRINT '    [REQUERIMIENTO OPERATIVO]: Para admitir logins internos de aplicaciones, se exige Modo Mixto.';
+    PRINT '    [PROCEDIMIENTO DE CAMBIO]:';
+    PRINT '        1. Ejecutar el cambio de registro del sistema o mediante interfaz SSMS.';
+    PRINT '        2. Comando técnico para cambiar a modo mixto (Valor = 2):';
+    PRINT '           EXEC xp_instance_regwrite N''HKEY_LOCAL_MACHINE'', N''Software\Microsoft\MSSQLServer\MSSQLServer'', N''LoginMode'', REG_DWORD, 2;';
+    PRINT '        3. REQUISITO CRÍTICO DE INFRAESTRUCTURA: Se debe reiniciar obligatoriamente el servicio de SQL Server (MSSQLSERVER) para aplicar los cambios.';
+END
+ELSE IF @AuthenticationMode = 2
+BEGIN
+    PRINT '    [AUDITORÍA - OK]: La instancia ya se encuentra en MODO MIXTO (Windows y SQL Server Authentication).';
+END
+GO
+
+
+-- =============================================================================
+-- REQUERIMIENTO 2: APROVISIONAMIENTO CON POLÍTICAS DE COMPLEJIDAD
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 2. CREACIÓN DE LOGINS (POLÍTICAS CORPORATIVAS)';
+PRINT '======================================================================';
+
+-- CHECK_EXPIRATION = ON: Fuerza las políticas de vencimiento de contraseñas de Windows Dominios.
+-- CHECK_POLICY = ON: Fuerza la complejidad de la clave (mayúsculas, números, longitud).
+
+PRINT '    --> Creando Login para SecAuditor_Gomez...';
+CREATE LOGIN SecAuditor_Gomez 
+WITH PASSWORD = 'C0mplej4.Auditoria.2026!', 
+     CHECK_EXPIRATION = ON, 
+     CHECK_POLICY = ON;
+
+PRINT '    --> Creando Login para NocMonitor_Lopez...';
+CREATE LOGIN NocMonitor_Lopez 
+WITH PASSWORD = 'C0mplej4.Monitor.2026!', 
+     CHECK_EXPIRATION = ON, 
+     CHECK_POLICY = ON;
+
+PRINT '    --> Creando Login para DbaJunior_Paz...';
+CREATE LOGIN DbaJunior_Paz 
+WITH PASSWORD = 'C0mplej4.DbaJr.2026!', 
+     CHECK_EXPIRATION = ON, 
+     CHECK_POLICY = ON;
+GO
+PRINT '    [OK]: Logins aprovisionados bajo directivas estrictas de contraseñas.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 3: GESTIÓN DE CICLO DE VIDA (VENTANA DE MANTENIMIENTO)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 3. SIMULACIÓN DE VENTANA DE MANTENIMIENTO / MITIGACIÓN';
+PRINT '======================================================================';
+
+PRINT '    --> Bloqueando acceso sospechoso detectado (NocMonitor_Lopez)...';
+ALTER LOGIN NocMonitor_Lopez DISABLE;
+
+PRINT '    --> Reestableciendo credenciales comprometidas por auditoría interna...';
+ALTER LOGIN NocMonitor_Lopez 
+WITH PASSWORD = 'NuevaClave.Emergencia.2026!!', 
+     UNLOCK; -- Fuerza el desbloqueo si el sistema operativo lo congeló por fuerza bruta.
+
+PRINT '    --> Reasignando base de datos por defecto del DBA Junior a un entorno corporativo seguro...';
+-- Evita que los usuarios caigan por defecto en 'master' al conectarse.
+ALTER LOGIN DbaJunior_Paz WITH DEFAULT_DATABASE = tempdb; 
+
+PRINT '    --> Reactivando acceso una vez mitigado el riesgo...';
+ALTER LOGIN NocMonitor_Lopez ENABLE;
+GO
+
+
+-- =============================================================================
+-- REQUERIMIENTO 4: SEPARACIÓN DE FUNCIONES (SERVER ROLES)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 4. ASIGNACIÓN DE PRIVILEGIOS MÍNIMOS (SERVER ROLES)';
+PRINT '======================================================================';
+
+-- El auditor revisa logs, contraseñas y configuraciones perimetrales
+PRINT '    --> Asignando SecAuditor_Gomez al rol [securityadmin]...';
+ALTER SERVER ROLE securityadmin ADD MEMBER SecAuditor_Gomez;
+
+-- El monitor de NOC analiza recursos de memoria, hilos y procesos del sistema
+PRINT '    --> Asignando NocMonitor_Lopez al rol [processadmin]...';
+ALTER SERVER ROLE processadmin ADD MEMBER NocMonitor_Lopez;
+
+-- El DBA Junior administra y da soporte al espacio en disco y Filegroups
+PRINT '    --> Asignando DbaJunior_Paz al rol [diskadmin]...';
+ALTER SERVER ROLE diskadmin ADD MEMBER DbaJunior_Paz;
+GO
+
+
+-- =============================================================================
+-- REQUERIMIENTO 5: VALIDACIÓN DINÁMICA DE AUDITORÍA
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 5. VALIDACIÓN DINÁMICA DE SEGURIDAD VIGENTE';
+PRINT '======================================================================';
+
+-- Consulta estructurada de catálogos del sistema para validar estados y roles
+SELECT 
+    sp.name AS NombreLogin,
+    sp.type_desc AS TipoDeLogin,
+    sp.is_disabled AS EstaBloqueado,
+    sp.default_database_name AS BaseDeDatosPorDefecto,
+    roles.name AS RolDeServidorAsignado
+FROM sys.server_principals sp
+-- Vinculación con los miembros de roles de servidor
+JOIN sys.server_role_members srm ON sp.principal_id = srm.member_principal_id
+JOIN sys.server_principals roles ON srm.role_principal_id = roles.principal_id
+WHERE sp.name IN ('SecAuditor_Gomez', 'NocMonitor_Lopez', 'DbaJunior_Paz')
+ORDER BY NombreLogin;
+GO
+PRINT '======================================================================';
+PRINT '>>> CONFIGURACIÓN DE SEGURIDAD COMPLETA APLICADA CON ÉXITO';
+PRINT '======================================================================';
+
+-- ********************************************Ejercicio 7******************************************************
+USE master;
+GO
+
+-- =============================================================================
+-- REQUERIMIENTO 1: MODELADO BASE
+-- =============================================================================
+PRINT '======================================================================';
+PRINT '>>> 1. CREANDO BASE DE DATOS Y ESQUEMAS OPERATIVOS';
+PRINT '======================================================================';
+
+IF EXISTS (SELECT * FROM sys.databases WHERE name = 'StreamPlayDB')
+BEGIN
+    ALTER DATABASE StreamPlayDB SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE StreamPlayDB;
+END
+GO
+
+CREATE DATABASE StreamPlayDB;
+GO
+
+USE StreamPlayDB;
+GO
+
+-- Estructuras clave / Tablas del negocio
+CREATE TABLE dbo.Suscripciones (
+    UsuarioID INT IDENTITY(1,1) PRIMARY KEY,
+    Email VARCHAR(100) NOT NULL,
+    PlanContratado VARCHAR(30) NOT NULL,
+    MontoMensual DECIMAL(10,2) NOT NULL,
+    NumeroTarjetaCredito VARCHAR(16) NOT NULL, -- Dato sensible financiero
+    TokenPago CHAR(36) NOT NULL
+);
+
+CREATE TABLE dbo.Catalogo (
+    ContenidoID INT IDENTITY(1,1) PRIMARY KEY,
+    Titulo VARCHAR(150) NOT NULL,
+    Genero VARCHAR(50) NOT NULL,
+    Clasificacion VARCHAR(10) NOT NULL,
+    AnioLanzamiento INT NOT NULL
+);
+
+CREATE TABLE dbo.Visualizaciones (
+    HistorialID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    UsuarioID INT NOT NULL,
+    ContenidoID INT NOT NULL,
+    FechaHora DATETIME DEFAULT GETDATE(),
+    MinutosReproducidos INT NOT NULL,
+    CONSTRAINT FK_Visualizaciones_Suscripciones FOREIGN KEY (UsuarioID) REFERENCES dbo.Suscripciones(UsuarioID),
+    CONSTRAINT FK_Visualizaciones_Catalogo FOREIGN KEY (ContenidoID) REFERENCES dbo.Catalogo(ContenidoID)
+);
+GO
+PRINT '    [OK] Tablas base del ecosistema StreamPlay creadas con éxito.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 2: APROVISIONAMIENTO PERIMETRAL (LOGINS Y USUARIOS MAPEADOS)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 2. CREANDO LOGINS DE SERVIDOR Y USUARIOS DE BASE DE DATOS';
+PRINT '======================================================================';
+
+-- Logins en la instancia (master)
+USE master;
+GO
+CREATE LOGIN Login_Soporte WITH PASSWORD = 'S0p0rt3.Pl4tf0rm.2026!';
+CREATE LOGIN Login_Creador WITH PASSWORD = 'Cr34t0r.Cont3nt.2026!';
+CREATE LOGIN Login_Gerente WITH PASSWORD = 'G3r3nt3.M4n4g3r.2026!';
+CREATE LOGIN Login_Auditor WITH PASSWORD = '4ud1t0r.SysOps.2026!';
+CREATE LOGIN Login_Sistemas WITH PASSWORD = 'S1st3m4s.Admin.2026!';
+GO
+
+-- Mapeo de usuarios dentro de la Base de Datos del negocio
+USE StreamPlayDB;
+GO
+CREATE USER User_Soporte FOR LOGIN Login_Soporte;
+CREATE USER User_Creador FOR LOGIN Login_Creador;
+CREATE USER User_Gerente FOR LOGIN Login_Gerente;
+CREATE USER User_Auditor FOR LOGIN Login_Auditor;
+CREATE USER User_Sistemas FOR LOGIN Login_Sistemas;
+GO
+PRINT '    [OK] 5 Logins y 5 Usuarios mapeados respectivamente.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 3: ROLES DE BASE DE DATOS FIJOS
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 3. ASIGNACIÓN DE ROLES FIJOS DE BASE DE DATOS';
+PRINT '======================================================================';
+
+-- El equipo de soporte técnico necesita lectura global para resolver incidentes
+ALTER ROLE db_datareader ADD MEMBER User_Soporte;
+
+-- El equipo de sistemas requiere facultades totales de manipulación de datos
+ALTER ROLE db_datareader ADD MEMBER User_Sistemas;
+ALTER ROLE db_datawriter ADD MEMBER User_Sistemas;
+GO
+PRINT '    [OK] Miembros asignados a los roles fijos db_datareader y db_datawriter.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 4: SEGURIDAD GRANULAR (GRANT)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 4. CONFIGURACIÓN DE PERMISOS GRANULARES A NIVEL DE OBJETO';
+PRINT '======================================================================';
+
+-- El perfil gerencial requiere visibilidad e inserción de datos operativos,
+-- pero se le restringe por completo la capacidad destructiva (sin DELETE)
+GRANT SELECT, INSERT, UPDATE ON dbo.Suscripciones TO User_Gerente;
+GRANT SELECT, INSERT, UPDATE ON dbo.Visualizaciones TO User_Gerente;
+GRANT SELECT ON dbo.Catalogo TO User_Gerente;
+GO
+PRINT '    [OK] Permisos granulares aplicados a User_Gerente (Sin capacidad de DELETE).';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 5: RESTRICCIÓN DE PRIVILEGIOS ABSOLUTA (DENY)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 5. IMPLEMENTACIÓN DE DENY (PROTECCIÓN PERIMETRAL Y FILTRADO)';
+PRINT '======================================================================';
+
+-- 5.1 Evitar modificaciones accidentales en el catálogo por parte de creadores de contenido
+GRANT SELECT, INSERT, UPDATE ON dbo.Catalogo TO User_Creador; 
+DENY DELETE ON dbo.Catalogo TO User_Creador; -- Bloqueo preventivo absoluto
+
+-- 5.2 Resguardo de datos financieros sensibles a nivel de celda/columna
+-- Ocultamos las columnas de tarjetas y tokens a Soporte (a pesar de tener db_datareader)
+DENY SELECT ON dbo.Suscripciones(NumeroTarjetaCredito, TokenPago) TO User_Soporte;
+GO
+PRINT '    [OK] Bloqueos de seguridad (DENY) establecidos a nivel de tabla y columna.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 6: SEGURIDAD AVANZADA Y ROLES PERSONALIZADOS
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 6. CREACIÓN DE ROL DE AUDITORÍA PERSONALIZADO';
+PRINT '======================================================================';
+
+-- Crear el rol personalizado a nivel de base de datos
+CREATE ROLE Rol_Auditor_Sistemas;
+GO
+
+-- Asignar privilegios al rol a medida
+GRANT SELECT ON SCHEMA::dbo TO Rol_Auditor_Sistemas; -- Lectura de todo el esquema de producción
+GRANT VIEW DEFINITION TO Rol_Auditor_Sistemas;       -- Inspección del código fuente del motor
+GO
+
+-- Asociar al usuario auditor dentro de nuestro nuevo grupo
+ALTER ROLE Rol_Auditor_Sistemas ADD MEMBER User_Auditor;
+GO
+PRINT '    [OK] Rol_Auditor_Sistemas configurado con herencia y VIEW DEFINITION.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 7: NORMALIZACIÓN DE PERMISOS (REVOKE)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 7. DEMOSTRACIÓN DE REMOCIÓN DE PERMISOS EXPLÍCITOS (REVOKE)';
+PRINT '======================================================================';
+
+-- Simulamos que el Creador de Contenido ya no debe cargar ni modificar datos directamente,
+-- removiendo los permisos de INSERT y UPDATE explícitos para devolverlo a un estado neutral.
+REVOKE INSERT, UPDATE ON dbo.Catalogo FROM User_Creador;
+GO
+PRINT '    [OK] Permisos explícitos revocados. El usuario regresa a su estado heredado básico.';
+
+
+-- =============================================================================
+-- VALIDACIÓN FINÁL DE LA MATRIZ DE SEGURIDAD
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> MATRIZ DE SEGURIDAD LÓGICA ACTIVA EN STREAMPLAYDB';
+PRINT '======================================================================';
+
+SELECT 
+    dp.name AS NombreUsuario,
+    dp.type_desc AS TipoUsuario,
+    o.name AS NombreTabla,
+    p.permission_name AS PermisoAsignado,
+    p.state_desc AS EstadoPermiso,
+    col.name AS ColumnaEspecifica
+FROM sys.database_permissions p
+JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id
+LEFT JOIN sys.objects o ON p.major_id = o.object_id
+LEFT JOIN sys.columns col ON p.major_id = col.object_id AND p.minor_id = col.column_id
+WHERE dp.name IN ('User_Soporte', 'User_Creador', 'User_Gerente', 'User_Auditor', 'Rol_Auditor_Sistemas')
+ORDER BY NombreUsuario, NombreTabla;
+GO
+
+-- ********************************************Ejercicio 8******************************************************
+USE msdb;
+GO
+
+-- Variables necesarias para capturar los IDs del Job y del Schedule
+DECLARE @jobId BINARY(16);
+DECLARE @scheduleId INT;
+
+-- =============================================================================
+-- REQUERIMIENTO 1: CONFIGURACIÓN GLOBAL DEL JOB
+-- =============================================================================
+PRINT '======================================================================';
+PRINT '>>> 1. CONFIGURANDO EL JOB GLOBAL EN EL AGENTE';
+PRINT '======================================================================';
+
+-- Eliminamos el Job si ya existía para permitir una ejecución limpia
+IF EXISTS (SELECT job_id FROM msdb.dbo.sysjobs WHERE name = N'Limpieza_Automatica_Accesos_SportNet')
+BEGIN
+    PRINT '    [AVISO]: El Job ya existe. Eliminando versión previa...';
+    EXEC msdb.dbo.sp_delete_job @job_name = N'Limpieza_Automatica_Accesos_SportNet', @delete_unused_schedule = 1;
+END
+
+-- Crear el nuevo Job
+EXEC msdb.dbo.sp_add_job 
+    @job_name = N'Limpieza_Automatica_Accesos_SportNet', 
+    @enabled = 1, 
+    @description = N'Mantenimiento automatizado para purgar el historial de accesos mayor a 30 días en SportNetDB.', 
+    @category_name = N'[Uncategorized (Local)]', 
+    @owner_login_name = N'sa',
+    @job_id = @jobId OUTPUT; -- Retorna el ID generado para los pasos posteriores
+
+PRINT '    [OK] Job ''Limpieza_Automatica_Accesos_SportNet'' creado de forma global.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 2: DEFINICIÓN DEL PASO (JOB STEP) CON POLÍTICA DE REINTENTOS
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 2. CREANDO PASO DE EJECUCIÓN T-SQL Y POLÍTICA DE FALLAS';
+PRINT '======================================================================';
+
+-- El comando ejecuta un DELETE basado en funciones de fecha nativas (DATEADD)
+DECLARE @ComandoTSQL NVARCHAR(MAX);
+SET @ComandoTSQL = N'
+DELETE FROM Socios.RegistroAccesos
+WHERE FechaHoraAcceso < DATEADD(day, -30, GETDATE());
+';
+
+EXEC msdb.dbo.sp_add_jobstep 
+    @job_id = @jobId, 
+    @step_name = N'Purgar_Accesos_Mayores_30_Dias', 
+    @step_id = 1, 
+    @cmdexec_success_code = 0, 
+    @on_success_action = 1, -- 1 = Quit the job reporting success (Terminar con éxito)
+    @on_fail_action = 2,    -- 2 = Quit the job reporting failure (Terminar con falla)
+    @os_run_priority = 0, 
+    @subsystem = N'TSQL',   -- Tipo de paso: Transact-SQL
+    @command = @ComandoTSQL, 
+    @database_name = N'SportNetDB', -- Contexto de ejecución
+    @retry_attempts = 2,    -- POLÍTICA EXIGIDA: 2 Reintentos ante fallas
+    @retry_interval = 5;    -- Intervalo de espera de 5 minutos entre reintentos
+GO
+
+
+-- =============================================================================
+-- REQUERIMIENTO 3: PLANIFICACIÓN HORARIA RECURRENTE (SCHEDULE)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 3. PROGRAMANDO LA PLANIFICACIÓN HORARIA (SCHEDULE)';
+PRINT '======================================================================';
+
+-- Capturamos nuevamente el ID del Job creado en el lote de arriba
+DECLARE @jobId BINARY(16);
+SELECT @jobId = job_id FROM msdb.dbo.sysjobs WHERE name = N'Limpieza_Automatica_Accesos_SportNet';
+
+-- Crear la agenda (Cada Domingo a las 03:00 AM)
+EXEC msdb.dbo.sp_add_schedule 
+    @schedule_name = N'Schedule_Domingos_03AM', 
+    @enabled = 1, 
+    @freq_type = 8,          -- 8 = Weekly (Semanal)
+    @freq_interval = 1,      -- 1 = Sunday (Domingo) en codificación semanal de SQL
+    @freq_subday_type = 1,   -- 1 = At the specified time (A la hora exacta especificada)
+    @freq_recurrence_factor = 1, -- Cada 1 semana
+    @active_start_date = 20260101, -- Fecha de inicio del schedule (Formato YYYYMMDD)
+    @active_start_time = 030000,   -- Hora de inicio: 03:00:00 AM (Formato HHMMSS)
+    @schedule_id = @scheduleId OUTPUT;
+
+-- Vincular la planificación (Schedule) al Job correspondiente
+EXEC msdb.dbo.sp_attach_schedule 
+    @job_id = @jobId, 
+    @schedule_name = N'Schedule_Domingos_03AM';
+GO
+PRINT '    [OK] Planificación horaria recurrente enlazada con éxito.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 4: ASIGNACIÓN DE DESTINO LOCAL
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 4. ASIGNANDO DESTINO LOCAL A LA INSTANCIA ACTUAL';
+PRINT '======================================================================';
+
+DECLARE @jobId BINARY(16);
+SELECT @jobId = job_id FROM msdb.dbo.sysjobs WHERE name = N'Limpieza_Automatica_Accesos_SportNet';
+
+-- Asociar el Job al servidor local actual ((local))
+EXEC msdb.dbo.sp_add_jobserver 
+    @job_id = @jobId, 
+    @server_name = N'(local)';
+GO
+PRINT '    [OK] Job configurado y habilitado localmente en el SQL Server Agent.';
+
+
+-- =============================================================================
+-- REQUERIMIENTO 5: VALIDACIÓN DINÁMICA DE LA CONFIGURACIÓN
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> 5. VALIDACIÓN DE AUDITORÍA INTERNA DEL JOB';
+PRINT '======================================================================';
+
+SELECT 
+    j.name AS NombreDelJob,
+    j.description AS Descripcion,
+    js.step_name AS NombreDelPaso,
+    js.database_name AS BaseDeDatosContexto,
+    js.retry_attempts AS ReintentosAsignados,
+    s.name AS NombrePlanificacion,
+    CASE s.freq_interval 
+        WHEN 1 THEN 'Domingos'
+        ELSE 'Otro Día'
+    END AS DiaDeEjecucion,
+    STUFF(STUFF(RIGHT('000000' + CAST(s.active_start_time AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':') AS HoraDeEjecucion
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobsteps js ON j.job_id = js.job_id
+JOIN msdb.dbo.sysjobschedules jsched ON j.job_id = jsched.job_id
+JOIN msdb.dbo.sysschedules s ON jsched.schedule_id = s.schedule_id
+WHERE j.name = N'Limpieza_Automatica_Accesos_SportNet';
+GO
+PRINT '======================================================================';
+
+-- ********************************************Ejercicio 9******************************************************
+USE master;
+GO
+
+-- =============================================================================
+-- FASE 1: INFRAESTRUCTURA BASE (ESTADO DE VENTAS - 08:00 AM)
+-- =============================================================================
+PRINT '======================================================================';
+PRINT '>>> FASE 1: CREANDO INFRAESTRUCTURA BASE Y DATOS INICIALES (08:00 AM)';
+PRINT '======================================================================';
+
+-- Eliminación limpia si ya existía del entorno de pruebas
+IF EXISTS (SELECT * FROM sys.databases WHERE name = 'CoffeeHouseDB')
+BEGIN
+    ALTER DATABASE CoffeeHouseDB SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE CoffeeHouseDB;
+END
+GO
+
+CREATE DATABASE CoffeeHouseDB;
+GO
+
+USE CoffeeHouseDB;
+GO
+
+-- Crear tablas del ecosistema comercial
+CREATE TABLE dbo.Clientes (
+    ClienteID INT IDENTITY(1,1) PRIMARY KEY,
+    Nombre VARCHAR(50) NOT NULL,
+    PuntosAcumulados INT DEFAULT 0
+);
+
+CREATE TABLE dbo.OrdenesCompra (
+    OrdenID INT IDENTITY(1,1) PRIMARY KEY,
+    ClienteID INT NOT NULL,
+    Producto VARCHAR(100) NOT NULL,
+    TotalFacturado DECIMAL(10,2) NOT NULL,
+    FechaVenta DATETIME DEFAULT GETDATE(),
+    CONSTRAINT FK_Ordenes_Clientes FOREIGN KEY (ClienteID) REFERENCES dbo.Clientes(ClienteID)
+);
+GO
+
+-- Carga de Datos Inicial (Ventas Tempranas)
+INSERT INTO dbo.Clientes (Nombre, PuntosAcumulados) VALUES ('Juan Pérez', 10), ('Ana Gómez', 25);
+INSERT INTO dbo.OrdenesCompra (ClienteID, Producto, TotalFacturado, FechaVenta) 
+VALUES 
+(1, 'Espresso + Croissant', 4500.00, '2026-06-13 08:15:00'),
+(2, 'Latte Macchiato XL', 3200.00, '2026-06-13 08:45:00');
+GO
+PRINT '    [OK] Base de datos e infraestructura base de las 08:00 AM lista.';
+
+
+-- =============================================================================
+-- FASE 2: LÍNEA BASE GENERAL (BACKUP FULL - 09:00 AM)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 2: CONFIGURACIÓN MODO FULL Y RESPALDO COMPLETO (09:00 AM)';
+PRINT '======================================================================';
+
+-- Configurar el Modelo de Recuperación Completo exigido por auditoría
+ALTER DATABASE CoffeeHouseDB SET RECOVERY FULL;
+GO
+
+-- Ejecutar el primer Backup Completo (Línea Base)
+BACKUP DATABASE CoffeeHouseDB
+TO DISK = 'C:\SQLBackups\CoffeeHouse_Full.bak'
+WITH FORMAT, INIT, NAME = 'CoffeeHouseDB - Backup Completo Inicial (09:00 AM)';
+GO
+PRINT '    [OK] Backup FULL generado de forma segura en disco.';
+
+
+-- =============================================================================
+-- FASE 3: PUNTO DE CONTROL ACUMULATIVO (BACKUP DIFERENCIAL - 11:00 AM)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 3: ACTIVIDAD DE LA MAÑANA Y RESPALDO DIFERENCIAL (11:00 AM)';
+PRINT '======================================================================';
+
+-- Simulación de ventas de la media mañana
+INSERT INTO dbo.Clientes (Nombre, PuntosAcumulados) VALUES ('Carlos López', 5);
+INSERT INTO dbo.OrdenesCompra (ClienteID, Producto, TotalFacturado, FechaVenta) 
+VALUES (3, 'Capuccino Italiano', 2800.00, '2026-06-13 10:20:00');
+GO
+
+-- Generar el Backup Diferencial (Empaqueta los cambios desde las 09:00 AM)
+BACKUP DATABASE CoffeeHouseDB
+TO DISK = 'C:\SQLBackups\CoffeeHouse_Diff.bak'
+WITH DIFFERENTIAL, FORMAT, INIT, NAME = 'CoffeeHouseDB - Backup Diferencial (11:00 AM)';
+GO
+PRINT '    [OK] Backup Diferencial generado con los cambios de la mañana.';
+
+
+-- =============================================================================
+-- FASE 4: RESGUARDOS TRANSACCIONALES (BACKUPS DE LOG)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 4: TRANSACCIONES DE LA TARDE Y RESPALDOS DE LOG SECUENCIALES';
+PRINT '======================================================================';
+
+-- 4.1 Ventas del mediodía
+INSERT INTO dbo.OrdenesCompra (ClienteID, Producto, TotalFacturado, FechaVenta) 
+VALUES (1, 'Cold Brew Coffee', 2500.00, '2026-06-13 11:45:00');
+GO
+
+-- Backup del Log 1 (12:00 PM) - Vacía virtualmente el archivo de transacciones
+BACKUP LOG CoffeeHouseDB
+TO DISK = 'C:\SQLBackups\CoffeeHouse_Log1.trn'
+WITH FORMAT, INIT, NAME = 'CoffeeHouseDB - Backup de Log 1 (12:00 PM)';
+GO
+
+-- 4.2 Ventas de la siesta/tarde
+INSERT INTO dbo.OrdenesCompra (ClienteID, Producto, TotalFacturado, FechaVenta) 
+VALUES (2, 'Frappuccino Dulce de Leche', 3800.00, '2026-06-13 13:30:00');
+GO
+
+-- Backup del Log 2 (02:00 PM)
+BACKUP LOG CoffeeHouseDB
+TO DISK = 'C:\SQLBackups\CoffeeHouse_Log2.trn'
+WITH FORMAT, INIT, NAME = 'CoffeeHouseDB - Backup de Log 2 (02:00 PM)';
+GO
+PRINT '    [OK] Cadena de logs transaccionales guardada de forma secuencial.';
+
+
+-- =============================================================================
+-- FASE 5: PROTOCOLO DE RECUPERACIÓN (RECONSTRUCCIÓN DE EMERGENCIA ANTE COLAPSO)
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 5: SIMULACIÓN DE COLAPSO CRÍTICO Y RESTAURACIÓN CRONOLÓGICA';
+PRINT '======================================================================';
+
+-- Simulamos la catástrofe forzando la desconexión y destrucción absoluta de la base de datos
+USE master;
+GO
+ALTER DATABASE CoffeeHouseDB SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+DROP DATABASE CoffeeHouseDB;
+PRINT '    [ALERTA]: Base de datos destruida por completo. Iniciando protocolo de Disaster Recovery...';
+GO
+
+-- PROTOCOLO DE RESTAURACIÓN PASO A PASO (Cadena ininterrumpida)
+
+-- Paso 5.1: Restaurar el Backup FULL con NORECOVERY (La BD queda en estado RESTORING)
+RESTORE DATABASE CoffeeHouseDB
+FROM DISK = 'C:\SQLBackups\CoffeeHouse_Full.bak'
+WITH NORECOVERY;
+PRINT '    -> Paso 1/4: Backup FULL restaurado (Estado: NORECOVERY).';
+
+-- Paso 5.2: Restaurar el Backup Diferencial con NORECOVERY (Avanza los datos hasta las 11:00 AM)
+RESTORE DATABASE CoffeeHouseDB
+FROM DISK = 'C:\SQLBackups\CoffeeHouse_Diff.bak'
+WITH NORECOVERY;
+PRINT '    -> Paso 2/4: Backup Diferencial acumulado aplicado (Estado: NORECOVERY).';
+
+-- Paso 5.3: Restaurar el Log de las 12:00 PM con NORECOVERY
+RESTORE LOG CoffeeHouseDB
+FROM DISK = 'C:\SQLBackups\CoffeeHouse_Log1.trn'
+WITH NORECOVERY;
+PRINT '    -> Paso 3/4: Transacciones del mediodía (Log 1) integradas (Estado: NORECOVERY).';
+
+-- Paso 5.4: Restaurar el último Log de las 02:00 PM con RECOVERY (Abre la base de datos al público)
+RESTORE LOG CoffeeHouseDB
+FROM DISK = 'C:\SQLBackups\CoffeeHouse_Log2.trn'
+WITH RECOVERY;
+PRINT '    -> Paso 4/4: Últimas transacciones (Log 2) integradas. Base de datos en producción (RECOVERY).';
+GO
+
+
+-- =============================================================================
+-- FASE 6: VALIDACIÓN DE INTEGRIDAD Y RECONCILIACIÓN DE DATOS
+-- =============================================================================
+PRINT '';
+PRINT '======================================================================';
+PRINT '>>> FASE 6: VALIDACIÓN DE INTEGRIDAD DE DATOS RECUPERADOS';
+PRINT '======================================================================';
+
+USE CoffeeHouseDB;
+GO
+
+-- Consulta analítica con combinación para verificar que no se perdió ninguna venta
+SELECT 
+    o.OrdenID,
+    c.Nombre AS NombreCliente,
+    o.Producto,
+    o.TotalFacturado,
+    CONVERT(VARCHAR(5), o.FechaVenta, 108) AS HoraVenta
+FROM dbo.OrdenesCompra o
+JOIN dbo.Clientes c ON o.ClienteID = c.ClienteID
+ORDER BY o.OrdenID;
+GO
+PRINT '======================================================================';
+PRINT '>>> OPERACIÓN DE CONTINGENCIA FINALIZADA CON CERO PÉRDIDA DE DATOS';
+PRINT '======================================================================';
+
+-- ********************************************Ejercicio 10*****************************************************
+-- 1. Respuesta Correcta: C
+--C) Always On AG, debido a que permite configurar copias legibles (Secondaries Read-Only) para reportes.
+
+
+-- 2. Respuesta Correcta: B
+-- B) El uso de almacenamiento compartido (SAN/NAS), que introduce un riesgo de punto único de falla.
+
+-- 3. Respuesta Correcta: B
+-- B) Debe rechazarse, porque es una tecnología depreciada sin soporte activo por parte de Microsoft.
+
+-- 4. Respuesta Correcta: D
+-- D) FCI protege la instancia completa de SQL Server, mientras que Always On protege un grupo de bases de datos elegidas.
+
+-- 5. Respuesta: 
+-- C) Ambas dependen de la configuración de un Windows Server Failover Cluster (WSFC).
